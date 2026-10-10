@@ -4,28 +4,26 @@
 // при необходимости подтягивает свежие данные через Serper.
 // ============================================================
 
-// Node 18+ содержит глобальный fetch. Для более старых версий — полифилл.
 const fetchFn = globalThis.fetch || (await import('node-fetch')).default;
 
 // --- Конфигурация из переменных окружения ---
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL =
-  process.env.OPENROUTER_MODEL || 'deepseek/deepseek-r1:free';
+  process.env.OPENROUTER_MODEL || 'qwen/qwen3.8-27b:free';
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
-// Максимум сообщений в истории (user+assistant считаются вместе).
 const MAX_HISTORY = 10;
+const VERSION = '1.0'; // Обязательное поле для Яндекс.Диалогов
 
-// --- Системный промпт для модели ---
 const SYSTEM_PROMPT = `Ты — полезный голосовой ассистент Алисы.
 Отвечай кратко, дружелюбно и по делу. Не используй markdown-разметку,
 списки и ссылки — твой ответ будет озвучен вслух.
+Отвечай ТОЛЬКО на русском языке, коротко, в 1-2 предложения.
 Если в блоке "Результаты поиска" есть актуальные данные — опирайся на них.
 Если данных нет — честно скажи, что не знаешь.`;
 
 // ============================================================
 // Определяем, нужен ли веб-поиск.
-// Триггерим Serper на «свежие» темы: новости, погода, курсы, события и т.п.
 // ============================================================
 function needsWebSearch(text) {
   if (!text) return false;
@@ -40,8 +38,7 @@ function needsWebSearch(text) {
 }
 
 // ============================================================
-// Поиск через Serper API. Возвращает строку с топ-3 результатами
-// или пустую строку при ошибке/отсутствии ключа.
+// Поиск через Serper API.
 // ============================================================
 async function searchWeb(query) {
   if (!SERPER_API_KEY) return '';
@@ -74,7 +71,53 @@ async function searchWeb(query) {
 }
 
 // ============================================================
-// Запрос к OpenRouter. Возвращает текст ответа или null при ошибке.
+// Срезаем reasoning-мусор, если модель начала «думать вслух».
+// ============================================================
+function stripReasoning(text) {
+  if (!text) return '';
+  let t = text;
+
+  // 1. Явные маркеры финального ответа.
+  const finalMarkers = [
+    /(?:^|\n)\s*final answer[:\s]*/i,
+    /(?:^|\n)\s*финальный ответ[:\s]*/i,
+    /(?:^|\n)\s*ответ пользователю[:\s]*/i,
+    /(?:^|\n)\s*answer[:\s]*/i
+  ];
+  for (const re of finalMarkers) {
+    const m = t.match(re);
+    if (m && m.index !== undefined) {
+      t = t.slice(m.index + m[0].length);
+      break;
+    }
+  }
+
+  // 2. Блок "Here's a thinking process".
+  if (/here'?s (a )?thinking process/i.test(t)) {
+    const drafts = [...t.matchAll(/draft[:\s]+([^\n]+(?:\n[^\n]+)*)/gi)];
+    if (drafts.length > 0) {
+      t = drafts[drafts.length - 1][1];
+    } else {
+      // Берём последний непустой абзац.
+      const paragraphs = t.split(/\n\s*\n/).filter((p) => p.trim());
+      t = paragraphs.length > 0 ? paragraphs[paragraphs.length - 1] : '';
+    }
+  }
+
+  // 3. Убираем префиксы.
+  t = t.replace(/^(draft|ответ|answer)[:\s]+/i, '').trim();
+
+  // 4. Схлопываем пробелы.
+  t = t.replace(/\s+/g, ' ').trim();
+
+  // 5. Убираем markdown.
+  t = t.replace(/[*_`#>]/g, '').trim();
+
+  return t;
+}
+
+// ============================================================
+// Запрос к OpenRouter.
 // ============================================================
 async function askOpenRouter(messages) {
   if (!OPENROUTER_API_KEY) {
@@ -89,15 +132,15 @@ async function askOpenRouter(messages) {
         headers: {
           Authorization: `Bearer ${OPENROUTER_API_KEY}`,
           'Content-Type': 'application/json',
-          // Опциональные заголовки OpenRouter (для аналитики):
           'HTTP-Referer': 'https://alice-skill.vercel.app',
           'X-Title': 'Alice Skill'
         },
         body: JSON.stringify({
           model: OPENROUTER_MODEL,
           messages,
-          temperature: 0.7,
-          max_tokens: 600
+          temperature: 0.6,
+          max_tokens: 250,
+          reasoning: { enabled: false }
         })
       }
     );
@@ -108,8 +151,9 @@ async function askOpenRouter(messages) {
     }
 
     const data = await res.json();
-    const text = data?.choices?.[0]?.message?.content?.trim();
-    return text || null;
+    const raw = data?.choices?.[0]?.message?.content || '';
+    const clean = stripReasoning(raw);
+    return clean.length > 0 ? clean : null;
   } catch (err) {
     console.error('OpenRouter request failed:', err);
     return null;
@@ -117,7 +161,7 @@ async function askOpenRouter(messages) {
 }
 
 // ============================================================
-// Утилита: обрезаем историю до последних N сообщений.
+// Обрезаем историю.
 // ============================================================
 function trimHistory(history) {
   if (!Array.isArray(history)) return [];
@@ -125,16 +169,31 @@ function trimHistory(history) {
 }
 
 // ============================================================
+// Ответ Алисе — с обязательным полем version.
+// ============================================================
+function aliceResponse(text, history, endSession = false, userState = null) {
+  return {
+    response: {
+      text,
+      end_session: endSession,
+      tts: text // дублируем для озвучки — Алиса так делает корректнее
+    },
+    session_state: { history: trimHistory(history) },
+    user_state: userState ?? { history: trimHistory(history) },
+    application_state: {},
+    version: VERSION // ← ГЛАВНОЕ ИСПРАВЛЕНИЕ
+  };
+}
+
+// ============================================================
 // Основной обработчик Vercel-функции.
 // ============================================================
 export default async function handler(req, res) {
-  // Яндекс.Диалоги присылают только POST.
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
 
-  // Vercel парсит JSON автоматически, но на всякий случай:
   const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
 
   try {
@@ -142,23 +201,19 @@ export default async function handler(req, res) {
     const session = body?.session || {};
     const state = body?.state || {};
 
-    // Текст пользователя: command приоритетнее, иначе original_utterance.
     const userText = (request.command || request.original_utterance || '').trim();
 
     // Приветствие при запуске навыка.
-    if (request.type === 'SimpleUtterance' && !userText && session.new) {
-      return res.status(200).json({
-        response: {
-          text: 'Привет! Спроси меня о чём угодно — я поищу в интернете, если нужно.',
-          end_session: false
-        },
-        session_state: { history: [] },
-        user_state: state.user || { history: [] },
-        application_state: {}
-      });
+    if (!userText && session.new) {
+      return res.status(200).json(
+        aliceResponse(
+          'Привет! Я Джарвис. Спроси меня о чём угодно — я поищу в интернете, если нужно.',
+          []
+        )
+      );
     }
 
-    // Восстанавливаем историю: session_state важнее user_state (короче срок жизни).
+    // Восстанавливаем историю.
     const sessionHistory = state.session?.history;
     const userHistory = state.user?.history;
     let history = Array.isArray(sessionHistory)
@@ -167,61 +222,40 @@ export default async function handler(req, res) {
         ? userHistory
         : [];
 
-    // --- 1. Возможно, нужен веб-поиск ---
+    // Веб-поиск при необходимости.
     let searchContext = '';
     if (needsWebSearch(userText)) {
       searchContext = await searchWeb(userText);
     }
 
-    // --- 2. Собираем сообщения для OpenRouter ---
+    // Собираем сообщения.
     const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
-
-    // Добавляем историю диалога (уже обрезанную).
     for (const m of trimHistory(history)) {
       if (m && m.role && m.content) messages.push(m);
     }
 
-    // Подмешиваем результаты поиска в контекст пользовательского сообщения.
     const userContent = searchContext
       ? `${userText}\n\n--- Результаты поиска в интернете ---\n${searchContext}`
       : userText;
 
     messages.push({ role: 'user', content: userContent });
 
-    // --- 3. Запрос к OpenRouter ---
+    // Запрос к OpenRouter.
     const answer = await askOpenRouter(messages);
 
-    // --- 4. Fallback при ошибке ---
     const replyText =
       answer ||
-      'Извини, сейчас не могу получить ответ. Попробуй переформулировать вопрос или повтори чуть позже.';
+      'Извини, сейчас не могу ответить. Попробуй переформулировать вопрос.';
 
-    // --- 5. Обновляем историю (пишем "чистый" текст пользователя без блока поиска) ---
+    // Обновляем историю.
     history.push({ role: 'user', content: userText });
     history.push({ role: 'assistant', content: replyText });
-    history = trimHistory(history);
 
-    // --- 6. Отдаём ответ Яндекс.Диалогам ---
-    return res.status(200).json({
-      response: {
-        text: replyText,
-        end_session: false
-      },
-      session_state: { history },
-      user_state: { history },
-      application_state: {}
-    });
+    return res.status(200).json(aliceResponse(replyText, history));
   } catch (err) {
     console.error('Webhook handler error:', err);
-    // Никогда не отдаём Алисе 500 — иначе она скажет "навык не отвечает".
-    return res.status(200).json({
-      response: {
-        text: 'Что-то пошло не так. Попробуй ещё раз.',
-        end_session: false
-      },
-      session_state: {},
-      user_state: {},
-      application_state: {}
-    });
+    return res.status(200).json(
+      aliceResponse('Что-то пошло не так. Попробуй ещё раз.', [])
+    );
   }
 }
