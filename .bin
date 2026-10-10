@@ -1,0 +1,8 @@
+alice-skill/
+├── api/
+│   └── webhook.js
+├── package.json
+├── vercel.json
+├── .env.example
+├── .gitignore
+└── README.md
